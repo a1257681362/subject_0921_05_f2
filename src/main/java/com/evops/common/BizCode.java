@@ -29,6 +29,8 @@ public enum BizCode {
     RX_AXIS_RANGE("RX_AXIS_RANGE", "轴位必须在 1 到 180 之间"),
     RX_PD_RANGE("RX_PD_RANGE", "瞳距必须在 20 到 90 之间"),
 
+    SENSITIVE_WORD_BLOCKED("SENSITIVE_WORD_BLOCKED", "文本包含拦截级敏感词，已拦截"),
+
     SYSTEM_ERROR("SYSTEM_ERROR", "系统处理失败");
 
     private final String code;

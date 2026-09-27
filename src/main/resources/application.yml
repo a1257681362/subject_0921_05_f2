@@ -31,6 +31,12 @@ mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
 
+evops:
+  sensitive:
+    enabled: true                                   # 敏感词扫描总开关
+    word-file: ./data/sensitive-words.txt           # 词库文件：每行 词|级别（BLOCK/MASK）
+    reload-interval-ms: 30000                       # 词库热更新：定时检测文件 mtime 的间隔
+
 logging:
   level:
     com.evops: INFO

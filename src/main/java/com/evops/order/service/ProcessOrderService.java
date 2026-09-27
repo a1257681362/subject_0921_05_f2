@@ -10,6 +10,8 @@ import com.evops.lens.service.LensService;
 import com.evops.order.dto.OrderActionRequest;
 import com.evops.order.dto.OrderCreateRequest;
 import com.evops.order.dto.OrderUpdateRequest;
+import com.evops.order.dto.ReworkRateReconcileRequest;
+import com.evops.order.dto.ReworkRateStats;
 import com.evops.order.dto.RxRequest;
 import com.evops.order.entity.ProcessOrder;
 import com.evops.order.entity.ProcessOrderRx;
@@ -17,16 +19,23 @@ import com.evops.order.entity.ProcessOrderStatusLog;
 import com.evops.order.mapper.ProcessOrderMapper;
 import com.evops.order.mapper.ProcessOrderRxMapper;
 import com.evops.order.mapper.ProcessOrderStatusLogMapper;
+import com.evops.sensitive.SensitiveHitLogService;
+import com.evops.sensitive.SensitiveWordService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * 加工单：建档（含左右眼处方）、修改、取镜状态流转、冲销/恢复、按单号检索。
@@ -54,18 +63,26 @@ public class ProcessOrderService {
     private ProcessOrderStatusLogMapper statusLogMapper;
     @Resource
     private LensMapper lensMapper;
+    @Resource
+    private SensitiveWordService sensitiveWordService;
+    @Resource
+    private SensitiveHitLogService sensitiveHitLogService;
 
     @Transactional(rollbackFor = Exception.class)
     public ProcessOrder create(OrderCreateRequest req) {
         Lens lens = requireActiveLens(req.getLensId());
 
+        // 文本入口管控：拦截级敏感词整单拒绝；打码级替换为 * 后落库
+        SensitiveWordService.MaskResult masked =
+                sensitiveWordService.checkOrderText(req.getCustomerName(), req.getRemark(), req.getOrderNo());
+
         ProcessOrder order = new ProcessOrder();
         order.setOrderNo(req.getOrderNo());
-        order.setCustomerName(req.getCustomerName());
+        order.setCustomerName(masked.getCustomerName());
         order.setCustomerPhone(req.getCustomerPhone());
         order.setStoreCode(req.getStoreCode());
         order.setLensId(lens.getId());
-        order.setRemark(req.getRemark());
+        order.setRemark(masked.getRemark());
         order.setOrderStatus(CREATED);
         // uk_order_no 兜底单号重复，uk_order_request 兜底请求号重复提交
         orderMapper.insert(order);
@@ -74,6 +91,8 @@ public class ProcessOrderService {
 
         order = orderMapper.selectById(order.getId());
         writeLog(order.getId(), "CREATE", null, CREATED, "加工单建档", order.getVersionNo());
+        // 打码命中记录与加工单同事务，同生共死
+        sensitiveHitLogService.recordMasked(masked.getHits(), order.getId(), order.getOrderNo());
         return order;
     }
 
@@ -88,11 +107,15 @@ public class ProcessOrderService {
         }
         Long lensId = req.getLensId() == null ? order.getLensId() : requireActiveLens(req.getLensId()).getId();
 
+        // 文本入口管控：仅扫描本次提交的字段（null 表示不修改）
+        SensitiveWordService.MaskResult masked =
+                sensitiveWordService.checkOrderText(req.getCustomerName(), req.getRemark(), order.getOrderNo());
+
         order.setLensId(lensId);
-        if (req.getCustomerName() != null) order.setCustomerName(req.getCustomerName());
+        if (req.getCustomerName() != null) order.setCustomerName(masked.getCustomerName());
         if (req.getCustomerPhone() != null) order.setCustomerPhone(req.getCustomerPhone());
         if (req.getStoreCode() != null) order.setStoreCode(req.getStoreCode());
-        if (req.getRemark() != null) order.setRemark(req.getRemark());
+        if (req.getRemark() != null) order.setRemark(masked.getRemark());
 
         if (orderMapper.updateById(order) == 0) {
             throw new BizException(BizCode.VERSION_CONFLICT);
@@ -104,6 +127,7 @@ public class ProcessOrderService {
 
         order = orderMapper.selectById(order.getId());
         writeLog(order.getId(), "UPDATE", CREATED, CREATED, "修改加工单及处方", order.getVersionNo());
+        sensitiveHitLogService.recordMasked(masked.getHits(), order.getId(), order.getOrderNo());
         return order;
     }
 
@@ -125,6 +149,12 @@ public class ProcessOrderService {
     @Transactional(rollbackFor = Exception.class)
     public ProcessOrder pickup(Long id, OrderActionRequest req) {
         return transit(id, "PICKUP", READY, PICKED_UP, req);
+    }
+
+    /** 返修：待取镜 → 加工中（成品复检不通过打回），只追加流转日志 */
+    @Transactional(rollbackFor = Exception.class)
+    public ProcessOrder rework(Long id, OrderActionRequest req) {
+        return transit(id, "REWORK", READY, PROCESSING, req);
     }
 
     /** 冲销：已建档/加工中 → 已冲销；已取镜不可冲销 */
@@ -212,6 +242,99 @@ public class ProcessOrderService {
         return statusLogMapper.selectList(new LambdaQueryWrapper<ProcessOrderStatusLog>()
                 .eq(ProcessOrderStatusLog::getOrderId, orderId)
                 .orderByAsc(ProcessOrderStatusLog::getId));
+    }
+
+    // ---------------- 返修率统计与反向核对（以加工单底账为准） ----------------
+
+    /**
+     * 返修率：分母为时段内建档的加工单（按 created_time，含已冲销），
+     * 分子为其中有 REWORK 流转记录的单数；reworkTimes 为返修总次数。
+     */
+    public ReworkRateStats reworkRate(String storeCode, LocalDateTime begin, LocalDateTime end) {
+        LambdaQueryWrapper<ProcessOrder> qw = new LambdaQueryWrapper<>();
+        if (storeCode != null && !storeCode.trim().isEmpty()) {
+            qw.eq(ProcessOrder::getStoreCode, storeCode.trim());
+        }
+        if (begin != null) {
+            qw.ge(ProcessOrder::getCreatedTime, begin);
+        }
+        if (end != null) {
+            qw.lt(ProcessOrder::getCreatedTime, end);
+        }
+        List<ProcessOrder> orders = orderMapper.selectList(qw);
+
+        Map<Long, String> orderNoById = new LinkedHashMap<>();
+        for (ProcessOrder order : orders) {
+            orderNoById.put(order.getId(), order.getOrderNo());
+        }
+
+        Map<Long, Integer> reworkTimesByOrder = new LinkedHashMap<>();
+        if (!orderNoById.isEmpty()) {
+            List<ProcessOrderStatusLog> reworkLogs = statusLogMapper.selectList(
+                    new LambdaQueryWrapper<ProcessOrderStatusLog>()
+                            .eq(ProcessOrderStatusLog::getOperType, "REWORK")
+                            .in(ProcessOrderStatusLog::getOrderId, orderNoById.keySet()));
+            for (ProcessOrderStatusLog log : reworkLogs) {
+                reworkTimesByOrder.merge(log.getOrderId(), 1, Integer::sum);
+            }
+        }
+
+        ReworkRateStats stats = new ReworkRateStats();
+        stats.setStoreCode(storeCode);
+        stats.setBegin(begin);
+        stats.setEnd(end);
+        stats.setTotalOrders(orders.size());
+        stats.setReworkOrders(reworkTimesByOrder.size());
+        int reworkTimes = reworkTimesByOrder.values().stream().mapToInt(Integer::intValue).sum();
+        stats.setReworkTimes(reworkTimes);
+        stats.setReworkRate(orders.isEmpty() ? BigDecimal.ZERO.setScale(4, RoundingMode.HALF_UP)
+                : BigDecimal.valueOf(reworkTimesByOrder.size())
+                        .divide(BigDecimal.valueOf(orders.size()), 4, RoundingMode.HALF_UP));
+        List<String> reworkOrderNos = new ArrayList<>();
+        for (Long orderId : reworkTimesByOrder.keySet()) {
+            reworkOrderNos.add(orderNoById.get(orderId));
+        }
+        stats.setReworkOrderNos(reworkOrderNos);
+        return stats;
+    }
+
+    /**
+     * 反向核对：兄弟组回传其返修率结果，系统以加工单底账重算并比对。
+     * 对方提供返修单号清单时，额外输出双向差集（我方有对方没有 / 对方有我方没有）。
+     */
+    public Map<String, Object> reconcileReworkRate(ReworkRateReconcileRequest req) {
+        ReworkRateStats ours = reworkRate(req.getStoreCode(), req.getBegin(), req.getEnd());
+
+        boolean totalMatch = ours.getTotalOrders() == req.getTotalOrders();
+        boolean reworkMatch = ours.getReworkOrders() == req.getReworkOrders();
+
+        Map<String, Object> diff = new LinkedHashMap<>();
+        diff.put("totalOrdersDiff", ours.getTotalOrders() - req.getTotalOrders());
+        diff.put("reworkOrdersDiff", ours.getReworkOrders() - req.getReworkOrders());
+
+        boolean consistent = totalMatch && reworkMatch;
+        if (req.getReworkOrderNos() != null) {
+            Set<String> theirs = new HashSet<>(req.getReworkOrderNos());
+            Set<String> oursSet = new HashSet<>(ours.getReworkOrderNos());
+            List<String> missingInTheirs = ours.getReworkOrderNos().stream()
+                    .filter(no -> !theirs.contains(no)).collect(Collectors.toList());
+            List<String> extraInTheirs = req.getReworkOrderNos().stream()
+                    .filter(no -> !oursSet.contains(no)).distinct().collect(Collectors.toList());
+            diff.put("missingInTheirs", missingInTheirs);
+            diff.put("extraInTheirs", extraInTheirs);
+            consistent = consistent && missingInTheirs.isEmpty() && extraInTheirs.isEmpty();
+        }
+
+        Map<String, Object> theirsView = new LinkedHashMap<>();
+        theirsView.put("totalOrders", req.getTotalOrders());
+        theirsView.put("reworkOrders", req.getReworkOrders());
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("consistent", consistent);
+        result.put("ours", ours);
+        result.put("theirs", theirsView);
+        result.put("diff", diff);
+        return result;
     }
 
     // ---------------- 处方校验与写入 ----------------

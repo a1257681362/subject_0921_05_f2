@@ -1,0 +1,8 @@
+# 敏感词库默认种子：词库文件缺失时复制为 data/sensitive-words.txt。
+# 每行一条：词|级别；级别 BLOCK=拦截（整单拒绝）、MASK=打码（缺省）。
+# # 开头为注释；词内分隔符会被忽略（“假 药” ≡ “假药”）；全角字符自动转半角。
+# 以下为示例词条，运营请按实际合规要求维护 data/sensitive-words.txt。
+假药|BLOCK
+走私|BLOCK
+代开发票|MASK
+黄牛|MASK

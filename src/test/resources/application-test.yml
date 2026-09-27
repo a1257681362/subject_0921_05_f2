@@ -7,3 +7,9 @@ spring:
     url: jdbc:h2:mem:evops_test;DB_CLOSE_DELAY=-1
     username: sa
     password:
+
+evops:
+  sensitive:
+    enabled: true
+    word-file: ./target/test-sensitive-words.txt
+    reload-interval-ms: 600000
