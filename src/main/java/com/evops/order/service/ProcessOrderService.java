@@ -17,6 +17,7 @@ import com.evops.order.entity.ProcessOrderStatusLog;
 import com.evops.order.mapper.ProcessOrderMapper;
 import com.evops.order.mapper.ProcessOrderRxMapper;
 import com.evops.order.mapper.ProcessOrderStatusLogMapper;
+import com.evops.sensitive.SensitiveWordService;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -54,18 +55,24 @@ public class ProcessOrderService {
     private ProcessOrderStatusLogMapper statusLogMapper;
     @Resource
     private LensMapper lensMapper;
+    @Resource
+    private SensitiveWordService sensitiveWordService;
 
     @Transactional(rollbackFor = Exception.class)
     public ProcessOrder create(OrderCreateRequest req) {
         Lens lens = requireActiveLens(req.getLensId());
 
+        // 文本入口敏感词守门：BLOCK 整单拒绝；MASK 打码后落库；扫描留痕与本事务同生共死
+        SensitiveWordService.MaskedOrderText guarded = sensitiveWordService.guardOrderText(
+                null, req.getOrderNo(), req.getCustomerName(), req.getRemark(), "CREATE");
+
         ProcessOrder order = new ProcessOrder();
         order.setOrderNo(req.getOrderNo());
-        order.setCustomerName(req.getCustomerName());
+        order.setCustomerName(guarded.getCustomerName());
         order.setCustomerPhone(req.getCustomerPhone());
         order.setStoreCode(req.getStoreCode());
         order.setLensId(lens.getId());
-        order.setRemark(req.getRemark());
+        order.setRemark(guarded.getRemark());
         order.setOrderStatus(CREATED);
         // uk_order_no 兜底单号重复，uk_order_request 兜底请求号重复提交
         orderMapper.insert(order);
@@ -93,6 +100,12 @@ public class ProcessOrderService {
         if (req.getCustomerPhone() != null) order.setCustomerPhone(req.getCustomerPhone());
         if (req.getStoreCode() != null) order.setStoreCode(req.getStoreCode());
         if (req.getRemark() != null) order.setRemark(req.getRemark());
+
+        // 守门扫描合并后的最终落库值：BLOCK 拒绝本次修改；MASK 打码后落库
+        SensitiveWordService.MaskedOrderText guarded = sensitiveWordService.guardOrderText(
+                order.getId(), order.getOrderNo(), order.getCustomerName(), order.getRemark(), "UPDATE");
+        order.setCustomerName(guarded.getCustomerName());
+        order.setRemark(guarded.getRemark());
 
         if (orderMapper.updateById(order) == 0) {
             throw new BizException(BizCode.VERSION_CONFLICT);
